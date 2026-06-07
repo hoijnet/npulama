@@ -35,7 +35,7 @@ impl App {
 
         let tray_menu = Menu::new();
         let show_item = MenuItem::new("Open", true, None);
-        let quit_item = MenuItem::new("Quit", true, None);
+        let quit_item = MenuItem::new("Exit", true, None);
         tray_menu
             .append_items(&[
                 &show_item,
@@ -312,7 +312,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.separator();
 
-            // ── Start / Stop ─────────────────────────────────────────────
+            // ── Start / Stop / Exit ──────────────────────────────────────
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if self.proxy_running {
@@ -339,6 +339,18 @@ impl eframe::App for App {
                         self.config.upstream_url = self.edit_upstream.trim().to_string();
                         self.start_proxy();
                     }
+                }
+
+                ui.add_space(8.0);
+
+                if ui
+                    .add(egui::Button::new(RichText::new("Exit").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(80, 80, 80)))
+                    .on_hover_text("Stop proxy and quit")
+                    .clicked()
+                {
+                    self.stop_proxy();
+                    std::process::exit(0);
                 }
             });
 

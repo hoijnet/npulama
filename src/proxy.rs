@@ -7,57 +7,91 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use serde_json::json;
-use std::sync::{Arc, RwLock};
+use std::{sync::{Arc, RwLock}, time::Duration};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::config::Config;
 
+// ── Shared handler state ──────────────────────────────────────────────────────
+
 #[derive(Clone)]
-struct ProxyState {
+pub struct ProxyState {
     upstream_url: Arc<RwLock<String>>,
     tokens: Arc<RwLock<Vec<String>>>,
     require_auth: Arc<RwLock<bool>>,
     client: reqwest::Client,
 }
 
+impl ProxyState {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            upstream_url: Arc::new(RwLock::new(config.upstream_url.clone())),
+            tokens: Arc::new(RwLock::new(config.tokens.clone())),
+            require_auth: Arc::new(RwLock::new(config.require_auth)),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .expect("Failed to build HTTP client"),
+        }
+    }
+}
+
+// ── Public start functions ────────────────────────────────────────────────────
+
+/// Normal GUI start: binds the port from config internally.
 pub fn start_proxy(config: Config) -> (oneshot::Sender<()>, JoinHandle<Result<(), String>>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let bind_addr = config.bind_addr();
-
-    let state = ProxyState {
-        upstream_url: Arc::new(RwLock::new(config.upstream_url.clone())),
-        tokens: Arc::new(RwLock::new(config.tokens.clone())),
-        require_auth: Arc::new(RwLock::new(config.require_auth)),
-        client: reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("Failed to build HTTP client"),
-    };
+    let state = ProxyState::from_config(&config);
 
     let handle = tokio::spawn(async move {
-        let app = Router::new().fallback(proxy_handler).with_state(state);
-
         let listener = TcpListener::bind(&bind_addr)
             .await
             .map_err(|e| format!("Failed to bind {}: {}", bind_addr, e))?;
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .map_err(|e| format!("Server error: {}", e))?;
-
-        Ok(())
+        serve(listener, state, shutdown_rx).await
     });
 
     (shutdown_tx, handle)
 }
 
+/// Test / advanced start: caller supplies an already-bound TcpListener.
+#[allow(dead_code)]
+/// Lets tests use port 0 (OS-assigned) and discover the real port before calling.
+pub fn start_proxy_with_listener(
+    listener: TcpListener,
+    config: Config,
+) -> (oneshot::Sender<()>, JoinHandle<Result<(), String>>) {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let state = ProxyState::from_config(&config);
+    let handle = tokio::spawn(serve(listener, state, shutdown_rx));
+    (shutdown_tx, handle)
+}
+
+// ── Internal serve loop ───────────────────────────────────────────────────────
+
+async fn serve(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    let app = Router::new().fallback(proxy_handler).with_state(state);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .map_err(|e| format!("Server error: {}", e))
+}
+
+// ── Request handler ───────────────────────────────────────────────────────────
+
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Response {
     let method = req.method().clone();
 
-    // CORS preflight
+    // CORS preflight (silent — not interesting for debugging)
     if method == axum::http::Method::OPTIONS {
         return Response::builder()
             .status(200)
@@ -69,7 +103,13 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
             .unwrap();
     }
 
-    // Auth check
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    // Auth
     if *state.require_auth.read().unwrap() {
         let auth_ok = req
             .headers()
@@ -80,6 +120,7 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
             .unwrap_or(false);
 
         if !auth_ok {
+            eprintln!("[npulama] 401 {} {} — invalid/missing token", method, path_and_query);
             return error_response(
                 401,
                 "invalid_api_key",
@@ -90,11 +131,6 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
 
     // Build upstream URL
     let upstream_base = state.upstream_url.read().unwrap().clone();
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
     let upstream_url = format!(
         "{}{}",
         upstream_base.trim_end_matches('/'),
@@ -108,13 +144,34 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
         Err(_) => return error_response(400, "bad_request", "Failed to read request body"),
     };
 
+    // Log every request
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            if v.len() > 14 { format!("{}…", &v[..14]) } else { v.to_string() }
+        })
+        .unwrap_or_else(|| "(none)".to_string());
+
+    eprintln!(
+        "[npulama] → {} {}  auth: {}",
+        method, upstream_url, auth_header
+    );
+    if !body_bytes.is_empty() {
+        eprintln!(
+            "[npulama]   body: {}",
+            truncate_utf8(&body_bytes, 32_768)
+        );
+    }
+
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
 
+    // body_bytes is Bytes (ref-counted) — clone is cheap
     let mut upstream_req = state
         .client
         .request(reqwest_method, &upstream_url)
-        .body(body_bytes);
+        .body(body_bytes.clone());
 
     for (name, value) in &headers {
         let n = name.as_str();
@@ -126,16 +183,43 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
+            eprintln!("[npulama] ✗ 502 — upstream unreachable: {}", e);
             return error_response(
                 502,
                 "upstream_error",
-                &format!("Cannot reach Foundry Local at {}: {}", upstream_base, e),
-            )
+                &format!("Cannot reach upstream at {}: {}", upstream_base, e),
+            );
         }
     };
 
-    let status = StatusCode::from_u16(upstream_resp.status().as_u16())
+    let status_u16 = upstream_resp.status().as_u16();
+    let status = StatusCode::from_u16(status_u16)
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    // On error responses: buffer the body so we can log it, then return it whole.
+    if !status.is_success() {
+        let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
+        eprintln!(
+            "[npulama] ✗ {} {} {}",
+            status_u16, method, path_and_query
+        );
+        eprintln!(
+            "[npulama]   request : {}",
+            truncate_utf8(&body_bytes, 32_768)
+        );
+        eprintln!(
+            "[npulama]   response: {}",
+            truncate_utf8(&resp_bytes, 32_768)
+        );
+        return Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
+            .body(Body::from(resp_bytes.to_vec()))
+            .unwrap();
+    }
+
+    eprintln!("[npulama] ✓ {} {} {}", status_u16, method, path_and_query);
 
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_resp.headers() {
@@ -157,14 +241,29 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
         .header("access-control-allow-headers", "authorization, content-type")
         .header("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
 
+    let log_path = path_and_query.clone();
     let stream = upstream_resp
         .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        .map_err(move |e| {
+            eprintln!("[npulama] ✗ stream error on {}: {}", log_path, e);
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        });
 
     builder.body(Body::from_stream(stream)).unwrap()
 }
 
-fn error_response(code: u16, error_type: &str, message: &str) -> Response {
+fn truncate_utf8(bytes: &[u8], max: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    if s.len() <= max {
+        s.into_owned()
+    } else {
+        format!("{}… ({} bytes total)", &s[..max], bytes.len())
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+pub fn error_response(code: u16, error_type: &str, message: &str) -> Response {
     Response::builder()
         .status(code)
         .header("content-type", "application/json")

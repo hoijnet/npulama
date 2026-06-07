@@ -1,0 +1,208 @@
+/// Integration tests for the npulama proxy.
+///
+/// Each test:
+///   1. Starts a tiny mock upstream with axum on a random OS port.
+///   2. Starts the proxy on another random OS port, pointing at the mock.
+///   3. Sends real HTTP requests through the proxy.
+///   4. Asserts on the response status / body / headers.
+///   5. Shuts both servers down cleanly.
+use axum::{routing::any, Router};
+use reqwest::Client;
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+
+use npulama::{config::Config, proxy::start_proxy_with_listener};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Spin up a bare-bones upstream that echoes the request path back as JSON.
+async fn start_mock_upstream() -> (u16, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    let app = Router::new().fallback(any(|req: axum::extract::Request| async move {
+        let path = req.uri().path().to_string();
+        axum::Json(json!({ "upstream": "ok", "path": path }))
+    }));
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { let _ = rx.await; })
+            .await
+            .ok();
+    });
+
+    (port, tx)
+}
+
+/// Start the proxy on a random OS port; return the port + shutdown sender.
+async fn start_proxy(config: Config) -> (u16, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, _handle) = start_proxy_with_listener(listener, config);
+    (port, tx)
+}
+
+fn base_config(upstream_port: u16) -> Config {
+    let mut c = Config::default();
+    c.upstream_url = format!("http://127.0.0.1:{}", upstream_port);
+    c.require_auth = false;
+    c
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_request_is_forwarded() {
+    let (up_port, _up_stop) = start_mock_upstream().await;
+    let (proxy_port, _proxy_stop) = start_proxy(base_config(up_port)).await;
+
+    let resp = Client::new()
+        .get(format!("http://127.0.0.1:{}/v1/models", proxy_port))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["upstream"], "ok");
+    assert_eq!(body["path"], "/v1/models");
+}
+
+#[tokio::test]
+async fn test_no_auth_required_by_default() {
+    let (up_port, _up_stop) = start_mock_upstream().await;
+    let (proxy_port, _proxy_stop) = start_proxy(base_config(up_port)).await;
+
+    // No Authorization header — should still succeed
+    let resp = Client::new()
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port))
+        .json(&json!({"model": "x", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_auth_rejects_missing_token() {
+    let (up_port, _up_stop) = start_mock_upstream().await;
+
+    let mut config = base_config(up_port);
+    config.require_auth = true;
+    config.tokens = vec!["sk-validtoken".into()];
+
+    let (proxy_port, _proxy_stop) = start_proxy(config).await;
+
+    let resp = Client::new()
+        .get(format!("http://127.0.0.1:{}/v1/models", proxy_port))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+}
+
+#[tokio::test]
+async fn test_auth_rejects_wrong_token() {
+    let (up_port, _up_stop) = start_mock_upstream().await;
+
+    let mut config = base_config(up_port);
+    config.require_auth = true;
+    config.tokens = vec!["sk-validtoken".into()];
+
+    let (proxy_port, _proxy_stop) = start_proxy(config).await;
+
+    let resp = Client::new()
+        .get(format!("http://127.0.0.1:{}/v1/models", proxy_port))
+        .header("authorization", "Bearer sk-wrongtoken")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn test_auth_accepts_valid_token() {
+    let (up_port, _up_stop) = start_mock_upstream().await;
+
+    let mut config = base_config(up_port);
+    config.require_auth = true;
+    config.tokens = vec!["sk-validtoken".into()];
+
+    let (proxy_port, _proxy_stop) = start_proxy(config).await;
+
+    let resp = Client::new()
+        .get(format!("http://127.0.0.1:{}/v1/models", proxy_port))
+        .header("authorization", "Bearer sk-validtoken")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_cors_preflight_returns_200() {
+    let (up_port, _up_stop) = start_mock_upstream().await;
+    let (proxy_port, _proxy_stop) = start_proxy(base_config(up_port)).await;
+
+    let resp = Client::new()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port),
+        )
+        .header("origin", "http://localhost:3000")
+        .header("access-control-request-method", "POST")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().contains_key("access-control-allow-origin"));
+    assert!(resp.headers().contains_key("access-control-allow-methods"));
+}
+
+#[tokio::test]
+async fn test_upstream_unreachable_returns_502() {
+    let mut config = Config::default();
+    config.upstream_url = "http://127.0.0.1:1".into(); // nothing listening there
+    config.require_auth = false;
+
+    let (proxy_port, _proxy_stop) = start_proxy(config).await;
+
+    let resp = Client::new()
+        .get(format!("http://127.0.0.1:{}/v1/models", proxy_port))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "upstream_error");
+}
+
+#[tokio::test]
+async fn test_path_and_query_are_forwarded() {
+    let (up_port, _up_stop) = start_mock_upstream().await;
+    let (proxy_port, _proxy_stop) = start_proxy(base_config(up_port)).await;
+
+    let resp = Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/v1/models?limit=10",
+            proxy_port
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // Path should include the query string on the upstream side
+    assert!(body["path"].as_str().unwrap().starts_with("/v1/models"));
+}
