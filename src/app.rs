@@ -24,6 +24,7 @@ pub struct App {
     proxy_error: Option<String>,
 
     show_token_full: Option<usize>,
+    model_filter: String,
 
     foundry_state: SharedFoundryState,
     shared_url: SharedUrl,
@@ -91,6 +92,7 @@ impl App {
             proxy_handle: None,
             proxy_error: None,
             show_token_full: None,
+            model_filter: String::new(),
             foundry_state,
             shared_url,
             last_sdk_status: SdkStatus::Uninitialized,
@@ -328,18 +330,38 @@ impl eframe::App for App {
                     ui.small(msg);
                 }
 
+                // Filter input
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("🔍");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.model_filter)
+                            .hint_text("Filter models…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if !self.model_filter.is_empty() && ui.small_button("✕").clicked() {
+                        self.model_filter.clear();
+                    }
+                });
+
                 // state.models is pre-seeded from cached_catalog on startup,
                 // then updated by the SDK — always use it directly.
+                let filter = self.model_filter.to_lowercase();
                 let display_models: Vec<(String, String, bool, bool)> = models
                     .iter()
+                    .filter(|m| filter.is_empty() || m.alias.to_lowercase().contains(&filter))
                     .map(|m| (m.alias.clone(), m.device.clone(), m.is_cached, m.is_loaded))
                     .collect();
 
-                ui.add_space(4.0);
                 let mut load_alias: Option<String> = None;
                 let mut unload_alias: Option<String> = None;
                 let mut set_preferred: Option<String> = None;
 
+                // ~6 rows visible; row height ≈ 22px + spacing
+                ScrollArea::vertical()
+                    .id_salt("model_list")
+                    .max_height(6.0 * 26.0)
+                    .show(ui, |ui| {
                 for (alias, device, is_cached, is_loaded) in &display_models {
                     let is_preferred = self.config.preferred_model.as_deref() == Some(alias.as_str());
                     ui.horizontal(|ui| {
@@ -396,6 +418,7 @@ impl eframe::App for App {
                         });
                     });
                 }
+                    }); // end model ScrollArea
 
                 if let Some(alias) = set_preferred {
                     self.config.preferred_model = Some(alias);

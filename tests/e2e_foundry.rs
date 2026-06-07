@@ -133,3 +133,137 @@ async fn test_capital_of_sweden_via_proxy() {
 
     shutdown.send(()).ok();
 }
+
+/// Ask phi-4-mini "What is the capital of Sweden?" via the proxy using SSE
+/// streaming and assert that the accumulated answer contains "Stockholm".
+///
+/// This exercises the exact path that was broken by reqwest auto-decompression
+/// and content-length mismatches — if streaming is healthy we get a full reply.
+#[tokio::test]
+async fn test_capital_of_sweden_streaming() {
+    use futures_util::StreamExt;
+
+    let foundry_url = skip_if_none!(
+        foundry_service_url(),
+        "Foundry Local is not running — start it with 'foundry server start'"
+    );
+
+    eprintln!("Foundry Local: {}  model: {}", foundry_url, MODEL);
+
+    let mut config = Config::default();
+    config.require_auth = false;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let (shutdown, _handle) = start_proxy_with_listener(listener, config, foundry_url.clone());
+
+    eprintln!("npulama proxy on 127.0.0.1:{}", proxy_port);
+
+    // ── Send a streaming chat completions request ─────────────────────────
+    let resp = Client::new()
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port))
+        .timeout(Duration::from_secs(120))
+        .json(&serde_json::json!({
+            "model": MODEL,
+            "stream": true,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the capital of Sweden? Reply with only the city name, one word."
+                }
+            ],
+            "max_tokens": 16,
+            "temperature": 0
+        }))
+        .send()
+        .await
+        .expect("POST /v1/chat/completions (streaming) failed");
+
+    let status = resp.status();
+    eprintln!("streaming response status: {}", status);
+    assert_eq!(status, 200, "Expected 200 from streaming chat completions");
+
+    // ── Collect SSE chunks and reconstruct the reply ──────────────────────
+    // Each chunk is: `data: {"choices":[{"delta":{"content":"..."}}]}\n\n`
+    // The stream ends with `data: [DONE]\n\n`.
+    let mut stream = resp.bytes_stream();
+    let mut full_text = String::new();
+    let mut chunk_count = 0usize;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("stream error reading SSE chunk");
+        let text = String::from_utf8_lossy(&chunk);
+
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data: ") else { continue };
+            if data.trim() == "[DONE]" { break; }
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                full_text.push_str(content);
+                chunk_count += 1;
+            }
+        }
+    }
+
+    eprintln!("Received {} delta chunks, assembled: {:?}", chunk_count, full_text);
+
+    assert!(
+        chunk_count > 0,
+        "Expected at least one content delta chunk — stream may be broken"
+    );
+    assert!(
+        full_text.to_lowercase().contains("stockholm"),
+        "Expected 'Stockholm' in streamed reply, got: {:?}",
+        full_text
+    );
+
+    shutdown.send(()).ok();
+}
+
+/// Send a request containing `max_completion_tokens` (an OpenAI v2 field that
+/// Foundry Local does not support) and assert the proxy strips it so that
+/// Foundry responds with 200 rather than an error.
+#[tokio::test]
+async fn test_max_completion_tokens_stripped_on_live_foundry() {
+    let foundry_url = skip_if_none!(
+        foundry_service_url(),
+        "Foundry Local is not running — start it with 'foundry server start'"
+    );
+
+    eprintln!("Foundry Local: {}  model: {}", foundry_url, MODEL);
+
+    let mut config = Config::default();
+    config.require_auth = false;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let (shutdown, _handle) = start_proxy_with_listener(listener, config, foundry_url.clone());
+
+    eprintln!("npulama proxy on 127.0.0.1:{}", proxy_port);
+
+    let resp = Client::new()
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port))
+        .timeout(Duration::from_secs(120))
+        .json(&serde_json::json!({
+            "model": MODEL,
+            "stream": false,
+            "messages": [{"role": "user", "content": "Reply with one word: yes"}],
+            "max_completion_tokens": 32000,
+            "temperature": 0
+        }))
+        .send()
+        .await
+        .expect("POST /v1/chat/completions failed");
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    eprintln!("response → {} — body: {}", status, body_text);
+
+    assert_eq!(
+        status, 200,
+        "Expected 200 — max_completion_tokens should have been stripped by proxy.\nbody: {}",
+        body_text
+    );
+
+    shutdown.send(()).ok();
+}

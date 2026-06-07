@@ -32,6 +32,15 @@ impl ProxyState {
             client: reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(Duration::from_secs(10))
+                // Disable all auto-decompression. As a transparent proxy we
+                // must not touch the response bytes — and SSE streams break if
+                // reqwest tries to gzip-decode them (gzip needs per-event flush
+                // which most servers don't do). Without this reqwest also adds
+                // its own Accept-Encoding header, conflicting with the client's.
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
                 .build()
                 .expect("Failed to build HTTP client"),
         }
@@ -170,27 +179,40 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
         "[npulama] → {} {}  auth: {}",
         method, upstream_url, auth_header
     );
-    if !body_bytes.is_empty() {
+    // Transform the request body if needed (e.g. drop fields Foundry rejects).
+    // `forward_body` is the exact byte sequence we send upstream from here on;
+    // `body_bytes` is kept only for error-path logging.
+    let forward_body = strip_unsupported_fields(&method, &path_and_query, body_bytes.clone());
+
+    if !forward_body.is_empty() {
         eprintln!(
             "[npulama]   body: {}",
-            truncate_utf8(&body_bytes, 32_768)
+            truncate_utf8(&forward_body, 32_768)
         );
     }
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
 
-    let mut upstream_req = state
-        .client
-        .request(reqwest_method, &upstream_url)
-        .body(body_bytes.clone());
+    // Forward all request headers except those that must not be proxied or that
+    // we manage ourselves:
+    //   - hop-by-hop headers (RFC 7230 §6.1) are connection-scoped
+    //   - host: reqwest derives it from the target URL
+    //   - authorization: auth is terminated at this proxy
+    //   - content-length: reqwest sets it from the sized body below, so it is
+    //     always consistent with the bytes we actually send (the client's value
+    //     may be stale after the body transform). Setting it here too would risk
+    //     a conflicting/duplicate header.
+    let mut upstream_req = state.client.request(reqwest_method, &upstream_url);
     for (name, value) in &headers {
         let n = name.as_str();
-        if n == "authorization" || n == "host" {
+        if n == "host" || n == "authorization" || n == "content-length" || is_hop_by_hop(n) {
             continue;
         }
         upstream_req = upstream_req.header(n, value.as_bytes());
     }
+    // Sized body → reqwest emits the matching Content-Length automatically.
+    let upstream_req = upstream_req.body(forward_body);
 
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -218,11 +240,7 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
 
         let mut builder = Response::builder().status(status);
         for (name, value) in &resp_headers {
-            let n = name.as_str();
-            if !matches!(n, "transfer-encoding" | "connection" | "keep-alive"
-                            | "access-control-allow-origin"
-                            | "access-control-allow-headers"
-                            | "access-control-allow-methods") {
+            if forward_response_header(name.as_str()) {
                 builder = builder.header(name, value);
             }
         }
@@ -238,16 +256,7 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
 
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_resp.headers() {
-        let n = name.as_str();
-        if !matches!(
-            n,
-            "transfer-encoding"
-                | "connection"
-                | "keep-alive"
-                | "access-control-allow-origin"
-                | "access-control-allow-headers"
-                | "access-control-allow-methods"
-        ) {
+        if forward_response_header(name.as_str()) {
             builder = builder.header(name, value);
         }
     }
@@ -265,6 +274,64 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
         });
 
     builder.body(Body::from_stream(stream)).unwrap()
+}
+
+/// Rewrite the body of chat completion requests to remove fields that
+/// Foundry Local does not support. Returns the original bytes unchanged
+/// if the request is not a chat completion or the body is not valid JSON.
+fn strip_unsupported_fields(
+    method: &axum::http::Method,
+    path: &str,
+    body: axum::body::Bytes,
+) -> axum::body::Bytes {
+    if method != axum::http::Method::POST || !path.starts_with("/v1/chat/completions") || body.is_empty() {
+        return body;
+    }
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(obj) = json.as_object_mut() else {
+        return body;
+    };
+
+    // max_completion_tokens is an OpenAI v2 field Foundry does not recognise.
+    // Only re-serialise when the field was actually present — otherwise return
+    // the original bytes unchanged so Content-Length stays valid.
+    if obj.remove("max_completion_tokens").is_none() {
+        return body;
+    }
+
+    serde_json::to_vec(&json)
+        .map(axum::body::Bytes::from)
+        .unwrap_or(body)
+}
+
+/// Hop-by-hop headers (RFC 7230 §6.1) are scoped to a single transport
+/// connection and must never be forwarded by a proxy in either direction.
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Whether an upstream *response* header should be copied to the client.
+/// Drops hop-by-hop headers and the CORS headers we set ourselves.
+fn forward_response_header(name: &str) -> bool {
+    !is_hop_by_hop(name)
+        && !matches!(
+            name,
+            "access-control-allow-origin"
+                | "access-control-allow-headers"
+                | "access-control-allow-methods"
+        )
 }
 
 fn truncate_utf8(bytes: &[u8], max: usize) -> String {

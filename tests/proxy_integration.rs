@@ -36,6 +36,28 @@ async fn start_mock_upstream() -> (u16, tokio::sync::oneshot::Sender<()>) {
     (port, tx)
 }
 
+/// Spin up an upstream that echoes the full request body back as JSON.
+async fn start_body_echo_upstream() -> (u16, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    let app = Router::new().fallback(any(|req: axum::extract::Request| async move {
+        let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+        let json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        axum::Json(json)
+    }));
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { let _ = rx.await; })
+            .await
+            .ok();
+    });
+
+    (port, tx)
+}
+
 /// Start the proxy on a random OS port pointing at the given upstream URL.
 async fn start_proxy(
     config: Config,
@@ -190,6 +212,56 @@ async fn test_upstream_unreachable_returns_502() {
     assert_eq!(resp.status(), 502);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "upstream_error");
+}
+
+#[tokio::test]
+async fn test_max_completion_tokens_stripped() {
+    let (up_port, _up_stop) = start_body_echo_upstream().await;
+    let url = format!("http://127.0.0.1:{}", up_port);
+    let (proxy_port, _proxy_stop) = start_proxy(base_config(), url).await;
+
+    let resp = Client::new()
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port))
+        .json(&json!({
+            "model": "phi-4-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 32000,
+            "temperature": 1.0
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // max_completion_tokens must be removed before forwarding
+    assert!(body.get("max_completion_tokens").is_none(), "max_completion_tokens should be stripped");
+    // other fields must survive intact
+    assert_eq!(body["model"], "phi-4-mini");
+    assert_eq!(body["temperature"], 1.0);
+}
+
+#[tokio::test]
+async fn test_body_without_max_completion_tokens_passes_unchanged() {
+    let (up_port, _up_stop) = start_body_echo_upstream().await;
+    let url = format!("http://127.0.0.1:{}", up_port);
+    let (proxy_port, _proxy_stop) = start_proxy(base_config(), url).await;
+
+    let resp = Client::new()
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port))
+        .json(&json!({
+            "model": "phi-4-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["model"], "phi-4-mini");
+    assert_eq!(body["temperature"], 0.7);
 }
 
 #[tokio::test]
