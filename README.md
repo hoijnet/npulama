@@ -16,7 +16,11 @@ The idea is to provide something that works like ollama and nolama, but for easy
 - Proxies all OpenAI API calls (`/v1/chat/completions`, `/v1/models`, …) from the Foundry-internal port to a configurable port on your machine and enables it over the network.
 - Strips fields that Foundry does not yet support (e.g. `max_completion_tokens`) so standard OpenAI clients work without modification.
 - Optionally requires a bearer token, making it safe to expose over your local network or through a tunnel.
-- Selects the right hardware automatically: NPU for low-power efficient inference, GPU for throughput, CPU as fallback.
+- Select the right hardware for your use case: NPU for low-power efficient inference, GPU for throughput, CPU as fallback.
+
+Looks like this. Not everything for systray handling is tested yet, but works on my machine:
+
+<img width="1266" height="1360" alt="image" src="https://github.com/user-attachments/assets/8643df03-b1c1-48a7-8e03-6387f52c3075" />
 
 ---
 
