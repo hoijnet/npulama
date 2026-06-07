@@ -10,22 +10,23 @@ use serde_json::json;
 use std::{sync::{Arc, RwLock}, time::Duration};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
-use crate::config::Config;
+use crate::{config::Config, foundry::SharedUrl};
 
 // ── Shared handler state ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct ProxyState {
-    upstream_url: Arc<RwLock<String>>,
+    upstream_url: SharedUrl,
     tokens: Arc<RwLock<Vec<String>>>,
     require_auth: Arc<RwLock<bool>>,
     client: reqwest::Client,
 }
 
 impl ProxyState {
-    pub fn from_config(config: &Config) -> Self {
+    /// Build proxy state sharing the given upstream URL Arc with the foundry module.
+    pub fn from_config(config: &Config, upstream: SharedUrl) -> Self {
         Self {
-            upstream_url: Arc::new(RwLock::new(config.upstream_url.clone())),
+            upstream_url: upstream,
             tokens: Arc::new(RwLock::new(config.tokens.clone())),
             require_auth: Arc::new(RwLock::new(config.require_auth)),
             client: reqwest::Client::builder()
@@ -40,10 +41,13 @@ impl ProxyState {
 // ── Public start functions ────────────────────────────────────────────────────
 
 /// Normal GUI start: binds the port from config internally.
-pub fn start_proxy(config: Config) -> (oneshot::Sender<()>, JoinHandle<Result<(), String>>) {
+pub fn start_proxy(
+    config: Config,
+    upstream: SharedUrl,
+) -> (oneshot::Sender<()>, JoinHandle<Result<(), String>>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let bind_addr = config.bind_addr();
-    let state = ProxyState::from_config(&config);
+    let state = ProxyState::from_config(&config, upstream);
 
     let handle = tokio::spawn(async move {
         let listener = TcpListener::bind(&bind_addr)
@@ -56,15 +60,16 @@ pub fn start_proxy(config: Config) -> (oneshot::Sender<()>, JoinHandle<Result<()
     (shutdown_tx, handle)
 }
 
-/// Test / advanced start: caller supplies an already-bound TcpListener.
+/// Test start: caller supplies an already-bound TcpListener and the upstream URL.
 #[allow(dead_code)]
-/// Lets tests use port 0 (OS-assigned) and discover the real port before calling.
 pub fn start_proxy_with_listener(
     listener: TcpListener,
     config: Config,
+    upstream_url: impl Into<String>,
 ) -> (oneshot::Sender<()>, JoinHandle<Result<(), String>>) {
+    let upstream = Arc::new(RwLock::new(upstream_url.into()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let state = ProxyState::from_config(&config);
+    let state = ProxyState::from_config(&config, upstream);
     let handle = tokio::spawn(serve(listener, state, shutdown_rx));
     (shutdown_tx, handle)
 }
@@ -129,8 +134,16 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
         }
     }
 
-    // Build upstream URL
+    // Build upstream URL — guard against no model being loaded yet
     let upstream_base = state.upstream_url.read().unwrap().clone();
+    if upstream_base.is_empty() {
+        eprintln!("[npulama] ✗ 503 {} {} — no model loaded (upstream URL is empty)", method, path_and_query);
+        return error_response(
+            503,
+            "model_not_loaded",
+            "No model is loaded. Open the npulama window, load a model, and try again.",
+        );
+    }
     let upstream_url = format!(
         "{}{}",
         upstream_base.trim_end_matches('/'),
@@ -167,17 +180,16 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
 
-    // body_bytes is Bytes (ref-counted) — clone is cheap
     let mut upstream_req = state
         .client
         .request(reqwest_method, &upstream_url)
         .body(body_bytes.clone());
-
     for (name, value) in &headers {
         let n = name.as_str();
-        if n != "authorization" && n != "host" {
-            upstream_req = upstream_req.header(n, value.as_bytes());
+        if n == "authorization" || n == "host" {
+            continue;
         }
+        upstream_req = upstream_req.header(n, value.as_bytes());
     }
 
     let upstream_resp = match upstream_req.send().await {
@@ -196,25 +208,28 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
     let status = StatusCode::from_u16(status_u16)
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    // On error responses: buffer the body so we can log it, then return it whole.
+    // On error responses: buffer body, log everything, forward to client.
     if !status.is_success() {
+        let resp_headers = upstream_resp.headers().clone();
         let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
-        eprintln!(
-            "[npulama] ✗ {} {} {}",
-            status_u16, method, path_and_query
-        );
-        eprintln!(
-            "[npulama]   request : {}",
-            truncate_utf8(&body_bytes, 32_768)
-        );
-        eprintln!(
-            "[npulama]   response: {}",
-            truncate_utf8(&resp_bytes, 32_768)
-        );
-        return Response::builder()
-            .status(status)
-            .header("content-type", "application/json")
+        eprintln!("[npulama] ✗ {} {} {}", status_u16, method, path_and_query);
+        eprintln!("[npulama]   request : {}", truncate_utf8(&body_bytes, 32_768));
+        eprintln!("[npulama]   response: {}", truncate_utf8(&resp_bytes, 32_768));
+
+        let mut builder = Response::builder().status(status);
+        for (name, value) in &resp_headers {
+            let n = name.as_str();
+            if !matches!(n, "transfer-encoding" | "connection" | "keep-alive"
+                            | "access-control-allow-origin"
+                            | "access-control-allow-headers"
+                            | "access-control-allow-methods") {
+                builder = builder.header(name, value);
+            }
+        }
+        return builder
             .header("access-control-allow-origin", "*")
+            .header("access-control-allow-headers", "authorization, content-type")
+            .header("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS")
             .body(Body::from(resp_bytes.to_vec()))
             .unwrap();
     }

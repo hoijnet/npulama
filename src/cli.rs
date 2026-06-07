@@ -13,10 +13,6 @@ pub struct Args {
     #[arg(long)]
     pub port: Option<u16>,
 
-    /// Foundry Local upstream URL (overrides saved config)
-    #[arg(long)]
-    pub upstream: Option<String>,
-
     /// Bind to 0.0.0.0 for network access (overrides saved config)
     #[arg(long)]
     pub bind_all: bool,
@@ -36,16 +32,20 @@ pub struct Args {
     /// Start proxy immediately on launch (GUI mode)
     #[arg(long)]
     pub autostart: bool,
+
+    /// Model alias to load on startup (overrides preferred_model in config)
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Context window size in tokens, 2048–131072 (overrides config)
+    #[arg(long)]
+    pub context: Option<u32>,
 }
 
 impl Args {
-    /// Merge CLI overrides into a loaded Config.
     pub fn apply_to(&self, config: &mut Config) {
         if let Some(port) = self.port {
             config.port = port;
-        }
-        if let Some(ref url) = self.upstream {
-            config.upstream_url = url.clone();
         }
         if self.bind_all {
             config.bind_all = true;
@@ -59,6 +59,12 @@ impl Args {
         }
         if self.autostart {
             config.autostart = true;
+        }
+        if let Some(ref m) = self.model {
+            config.preferred_model = Some(m.clone());
+        }
+        if let Some(c) = self.context {
+            config.context_size = c.clamp(2048, 131072);
         }
     }
 }

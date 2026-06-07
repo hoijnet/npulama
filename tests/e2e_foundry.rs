@@ -66,12 +66,11 @@ async fn test_capital_of_sweden_via_proxy() {
 
     // ── 2. Start proxy pointing at Foundry Local ──────────────────────────
     let mut config = Config::default();
-    config.upstream_url = foundry_url.clone();
     config.require_auth = false;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_port = listener.local_addr().unwrap().port();
-    let (shutdown, _handle) = start_proxy_with_listener(listener, config);
+    let (shutdown, _handle) = start_proxy_with_listener(listener, config, foundry_url.clone());
 
     eprintln!("npulama proxy on 127.0.0.1:{}", proxy_port);
 

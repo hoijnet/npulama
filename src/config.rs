@@ -1,14 +1,26 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CachedModel {
+    pub alias: String,
+    pub device: String,  // "CPU" | "GPU" | "NPU"
+    pub is_cached: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
     pub port: u16,
     pub bind_all: bool,
-    pub upstream_url: String,
     pub tokens: Vec<String>,
     pub require_auth: bool,
     pub autostart: bool,
+    pub preferred_model: Option<String>,
+    /// Context window size in tokens. Default 4096, max 131072 (128K).
+    pub context_size: u32,
+    /// Last-known model catalog — shown immediately on startup before SDK loads.
+    #[serde(default)]
+    pub cached_catalog: Vec<CachedModel>,
 }
 
 impl Default for Config {
@@ -16,10 +28,12 @@ impl Default for Config {
         Self {
             port: 11434,
             bind_all: false,
-            upstream_url: "http://127.0.0.1:52495".to_string(),
             tokens: vec![],
             require_auth: false,
             autostart: false,
+            preferred_model: None,
+            context_size: 4096,
+            cached_catalog: vec![],
         }
     }
 }
