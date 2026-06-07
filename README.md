@@ -8,6 +8,8 @@ Only tested with Zed so far and a test OpenAI chat client.
 
 The idea is to provide something that works like ollama and nolama, but for easy to install and run.
 
+Give a star if you like it ⭐💫
+
 ---
 
 ## What it does
